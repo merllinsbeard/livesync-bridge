@@ -13,6 +13,12 @@ export type Origin = {
     winner: string;
     base: { rev: string; sha256: string | null } | null;
 };
+export type Delivery = Origin & {
+    // Runs `write` only while the vault's verified base is still the one this revision was checked against, and then
+    // makes this revision the base. Once the vault has confirmed another revision, it resolves false without running
+    // `write`, and the CouchDB peer reads its winner again.
+    apply(write: () => Promise<boolean>): Promise<boolean>;
+};
 
 export interface PeerStorageConf {
     scanOfflineChanges?: boolean;

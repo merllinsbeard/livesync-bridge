@@ -5,7 +5,7 @@ import {
     MILESTONE_DOCID,
     type TweakValues,
 } from "@vrtmrz/livesync-commonlib/compat/common/types";
-import { PeerCouchDBConf, FileData, type CouchRevisions, type Origin } from "./types.ts";
+import { PeerCouchDBConf, FileData, type CouchRevisions, type Delivery, type Origin } from "./types.ts";
 import { decodeBinary } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/convert";
 import { isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/path";
 import { DispatchFun, Peer, PeerHealth } from "./Peer.ts";
@@ -102,6 +102,9 @@ export class PeerCouchDB extends Peer {
             released.then(() => this._retiredManipulatorClosures.delete(released), (error) =>
                 this.normalLog(`Closing the previous CouchDB connection failed: ${error instanceof Error ? error.message : error}`, LOG_LEVEL_NOTICE));
         }
+    }
+    override async isRepeating(path: string, data: FileData | false): Promise<boolean> {
+        return !this._isProtected(path) && await super.isRepeating(path, data);
     }
     // Resolves true when CouchDB stored the change, false when there was nothing to store,
     // and rejects when it was not stored, so the vault side does not record it as synced.
@@ -461,9 +464,6 @@ export class PeerCouchDB extends Peer {
     private _withBasePathLock<T>(path: string, operation: () => Promise<T>): Promise<T> {
         return serialized(`couch-base:${this.config.name}:${path}`, operation);
     }
-    private async _setBase(path: string, rev: string, bytes: Uint8Array<ArrayBuffer> | null) {
-        this.setSetting(`rev-${path}`, JSON.stringify({ rev, sha256: bytes && await sha256(bytes) } satisfies Base));
-    }
     private async _recordAndConfirmBase(path: string, rev: string, bytes: Uint8Array<ArrayBuffer> | null, mtime: number | null) {
         const confirmed: Base = { rev, sha256: bytes && await sha256(bytes) };
         const base = this._base(path);
@@ -516,11 +516,13 @@ export class PeerCouchDB extends Peer {
         return path;
     }
     private async _bringProtected(path: string, id: DocumentID) {
-        const before = this.getSetting(`rev-${path}`);
-        const current = await this._currentDoc(id, { conflicts: true, revs: true });
-        if (!current || !isNoteEntry(current)) return;
-        await this._preserveConflicts(path, current);
-        await this._deliverWinnerOnUnchangedBase(path, current, await this.man.getByMeta(current), before);
+        for (;;) {
+            const before = this.getSetting(`rev-${path}`);
+            const current = await this._currentDoc(id, { conflicts: true, revs: true });
+            if (!current || !isNoteEntry(current)) return;
+            await this._preserveConflicts(path, current);
+            if (await this._deliverWinner(path, current, await this.man.getByMeta(current), before) === "confirmed") return;
+        }
     }
     // A hard deletion (`_deleted`) hides the document from a plain read; LiveSync keeps the body in the tombstone,
     // other clients leave it bodiless, so the file is then found through the tombstone's parent.
@@ -531,9 +533,11 @@ export class PeerCouchDB extends Peer {
         const path = isNoteEntry(tombstone) ? this._vaultPath(tombstone, baseDir) : await this._tombstonePath(tombstone, baseDir);
         if (path === undefined) return;
         if (!this._isProtected(path)) return await this.dispatch(path, false);
-        const before = this.getSetting(`rev-${path}`);
-        if (await this._currentDoc(doc._id)) return;
-        await this._deliverWinnerOnUnchangedBase(path, tombstone, undefined, before);
+        for (;;) {
+            const before = this.getSetting(`rev-${path}`);
+            if (await this._currentDoc(doc._id)) return;
+            if (await this._deliverWinner(path, tombstone, undefined, before) === "confirmed") return;
+        }
     }
     private async _tombstonePath(tombstone: EntryWithMeta, baseDir: string): Promise<string | undefined> {
         const { start, ids } = tombstone._revisions!;
@@ -551,26 +555,40 @@ export class PeerCouchDB extends Peer {
         this.normalLog(`Deleted document ${tombstone._id} at ${tombstone._rev} maps to no known file; the vault is left as it is`, LOG_LEVEL_NOTICE);
         return undefined;
     }
-    private async _deliverWinnerOnUnchangedBase(path: string, doc: EntryWithMeta, entry: ManipulatorReadyEntry | undefined, before: string | null) {
+    private async _deliverWinner(path: string, doc: EntryWithMeta, entry: ManipulatorReadyEntry | undefined, before: string | null): Promise<"retry" | "confirmed"> {
         const stored = await this._withBasePathLock(path, async () => {
             if (this.getSetting(`rev-${path}`) !== before) return undefined;
             await this._recordPendingAncestor(path, doc);
             return this.getSetting(`rev-${path}`);
         });
-        if (stored === undefined) return;
+        if (stored === undefined) return "retry";
         const base = stored ? JSON.parse(stored) as Base : null;
-        if (base?.rev === doc._rev) return;
-        const origin: Origin = { peer: this.config.name, rev: doc._rev, revisions: doc._revisions!, winner: doc._rev, base };
+        if (base?.rev === doc._rev) return "confirmed";
+        const bytes = entry === undefined || entry.deleted || entry._deleted ? null : entryBytes(entry);
+        const delivered = JSON.stringify({ rev: doc._rev, sha256: bytes && await sha256(bytes) } satisfies Base);
+        let outcome: "retry" | "confirmed" | undefined;
+        const delivery: Delivery = {
+            peer: this.config.name, rev: doc._rev, revisions: doc._revisions!, winner: doc._rev, base,
+            apply: (write) => this._withBasePathLock(path, async () => {
+                if (this.getSetting(`rev-${path}`) !== stored) {
+                    outcome = "retry";
+                    this.normalLog(`${path}: revision ${doc._rev} was not written to the vault, which confirmed another revision meanwhile; reading the winner again`, LOG_LEVEL_NOTICE);
+                    return false;
+                }
+                const written = await write();
+                this.setSetting(`rev-${path}`, delivered);
+                outcome = "confirmed";
+                return written;
+            }),
+        };
         if (entry === undefined) {
             this.sendLog(`${path} delete detected`);
-            await this.dispatch(path, false, origin);
+            await this.dispatch(path, false, delivery);
         } else {
-            await this._deliver(path, entry, origin);
+            await this._deliver(path, entry, delivery);
         }
-        const bytes = entry === undefined || entry.deleted || entry._deleted ? null : entryBytes(entry);
-        await this._withBasePathLock(path, async () => {
-            if (this.getSetting(`rev-${path}`) === stored) await this._setBase(path, doc._rev, bytes);
-        });
+        if (outcome === undefined) throw new Error(`${path}: revision ${doc._rev} reached no vault that checks it against the verified base`);
+        return outcome;
     }
     private async _preserveConflicts(path: string, current: EntryWithMeta) {
         for (const rev of current._conflicts ?? []) {
@@ -587,20 +605,20 @@ export class PeerCouchDB extends Peer {
             this.setSetting(key, current._rev);
         }
     }
-    private async _deliver(path: string, entry: ManipulatorReadyEntry, origin?: Origin) {
+    private async _deliver(path: string, entry: ManipulatorReadyEntry, delivery?: Delivery) {
         if (entry.deleted || entry._deleted) {
             this.sendLog(`${path} delete detected`);
-            await this.dispatch(path, false, origin);
+            await this.dispatch(path, false, delivery);
             return;
         }
         const data = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
         this.sendLog(`${path} change detected`);
-        await this.dispatch(path, { ctime: entry.ctime, mtime: entry.mtime, size: entry.size, deleted: false, data }, origin);
+        await this.dispatch(path, { ctime: entry.ctime, mtime: entry.mtime, size: entry.size, deleted: false, data }, delivery);
     }
-    async dispatch(path: string, data: FileData | false, origin?: Origin) {
-        if (await this.isRepeating(path, data) && !origin) return;
+    async dispatch(path: string, data: FileData | false, delivery?: Delivery) {
+        if (await this.isRepeating(path, data)) return;
         try {
-            await this.dispatchToHub(this, this.toGlobalPath(path), data, origin);
+            await this.dispatchToHub(this, this.toGlobalPath(path), data, delivery);
         } catch (error) {
             this.cache.set(path, "");
             throw error;

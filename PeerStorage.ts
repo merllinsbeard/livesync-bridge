@@ -1,4 +1,4 @@
-import { PeerStorageConf, FileData, type Origin } from "./types.ts";
+import { PeerStorageConf, FileData, type Delivery, type Origin } from "./types.ts";
 import { getDocData } from "@vrtmrz/livesync-commonlib/compat/common/utils";
 import { isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/path";
 import { parse, format, relative, resolve } from "@std/path";
@@ -29,8 +29,17 @@ export class PeerStorage extends Peer {
         super(conf, dispatcher);
     }
 
-    async delete(pathSrc: string, origin?: Origin): Promise<boolean> {
-        return await this.section(pathSrc, () => new StorageWriteProtocol(this.config).locked(() => this.deleteLocked(pathSrc, origin)));
+    async delete(pathSrc: string, delivery?: Delivery): Promise<boolean> {
+        return await this.section(pathSrc, () => this.applyIncoming(pathSrc, delivery, (origin) => this.deleteLocked(pathSrc, origin)));
+    }
+    private async applyIncoming(pathSrc: string, delivery: Delivery | undefined, write: (origin?: Origin) => Promise<boolean>): Promise<boolean> {
+        const protocol = new StorageWriteProtocol(this.config);
+        if (!delivery) {
+            if (this.isProtected(pathSrc)) throw new Error(`${pathSrc} is protected; a change that does not carry its CouchDB revision is not written`);
+            return await protocol.locked(() => write());
+        }
+        if (!this.isProtected(pathSrc)) throw new Error(`${pathSrc} came as a protected CouchDB revision, but this vault does not protect it; it is not written`);
+        return await delivery.apply(() => protocol.locked(() => write(delivery)));
     }
     private async deleteLocked(pathSrc: string, origin?: Origin): Promise<boolean> {
         const lp = this.toLocalPath(pathSrc);
@@ -66,8 +75,8 @@ export class PeerStorage extends Peer {
         this.runScript(path, true);
         return true;
     }
-    async put(pathSrc: string, data: FileData, origin?: Origin): Promise<boolean> {
-        return await this.section(pathSrc, () => new StorageWriteProtocol(this.config).locked(() => this.putLocked(pathSrc, data, origin)));
+    async put(pathSrc: string, data: FileData, delivery?: Delivery): Promise<boolean> {
+        return await this.section(pathSrc, () => this.applyIncoming(pathSrc, delivery, (origin) => this.putLocked(pathSrc, data, origin)));
     }
     private async putLocked(pathSrc: string, data: FileData, origin?: Origin): Promise<boolean> {
         const lp = this.toLocalPath(pathSrc);
@@ -190,9 +199,12 @@ export class PeerStorage extends Peer {
         return path || ".";
     }
 
+    private isProtected(path: string): boolean {
+        return this.config.writeProtocol?.protectedPaths.some(pattern => minimatch(path, pattern)) ?? false;
+    }
+
     private async fileStat(path: string, data: FileData): Promise<string> {
-        const protectedPath = this.config.writeProtocol?.protectedPaths.some(pattern => minimatch(path, pattern));
-        return `${data.mtime}-${data.size}${protectedPath ? ":" + await computeHash(data.data) : ""}`;
+        return `${data.mtime}-${data.size}${this.isProtected(path) ? ":" + await computeHash(data.data) : ""}`;
     }
 
     private async forward(path: string, run?: number): Promise<void> {

@@ -1,4 +1,4 @@
-import { Config, FileData, type Origin } from "./types.ts";
+import { Config, FileData, type Delivery } from "./types.ts";
 import { Peer, PeerHealth } from "./Peer.ts";
 import { PeerStorage } from "./PeerStorage.ts";
 import { PeerCouchDB } from "./PeerCouchDB.ts";
@@ -58,14 +58,14 @@ export class Hub {
         })();
     }
 
-    async dispatch(source: Peer, path: string, data: FileData | false, origin?: Origin) {
+    async dispatch(source: Peer, path: string, data: FileData | false, delivery?: Delivery) {
         for (const peer of this.peers) {
             if (peer !== source && (source.config.group ?? "") === (peer.config.group ?? "")) {
                 let ret = false;
                 if (data === false) {
-                    ret = await peer.delete(path, origin);
+                    ret = await peer.delete(path, delivery);
                 } else {
-                    ret = await peer.put(path, data, origin);
+                    ret = await peer.put(path, data, delivery);
                 }
                 if (ret) {
                     // Logger(`  ${data === false ? "-x->" : "--->"} ${peer.config.name} ${path} `)
