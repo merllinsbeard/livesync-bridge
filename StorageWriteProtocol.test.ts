@@ -1,7 +1,7 @@
 import { join } from "@std/path";
 import { PeerStorage } from "./PeerStorage.ts";
 import { StorageWriteProtocol, replaceStorageFile } from "./StorageWriteProtocol.ts";
-import type { Origin, PeerStorageConf } from "./types.ts";
+import type { Delivery, Origin, PeerStorageConf } from "./types.ts";
 
 function equal(actual: unknown, expected: unknown) {
     if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -21,6 +21,9 @@ async function fixture(operation: (root: string, config: PeerStorageConf) => Pro
         await Deno.remove(root, { recursive: true });
     }
 }
+
+const revision: Origin = { peer: "remote", rev: "2-incoming", winner: "2-incoming", revisions: { start: 2, ids: ["incoming", "base"] }, base: null };
+const unguardedDelivery = (origin = revision): Delivery => ({ ...origin, apply: (write) => write() });
 
 async function records(config: PeerStorageConf) {
     const result = [];
@@ -43,7 +46,7 @@ Deno.test("received write preserves both complete versions and original source t
     const path = join(config.baseDir, "tasks.md");
     await Deno.writeTextFile(path, "owner checked B\n");
     const peer = new PeerStorage(config, async () => {});
-    equal(await peer.put("tasks.md", { ctime: 0, mtime: 1791795000000, size: 16, data: ["offline V later\n"] }), true);
+    equal(await peer.put("tasks.md", { ctime: 0, mtime: 1791795000000, size: 16, data: ["offline V later\n"] }, unguardedDelivery()), true);
     equal(await Deno.readTextFile(path), "offline V later\n");
     const [record] = await records(config);
     equal(record.path, "tasks.md");
@@ -59,8 +62,8 @@ Deno.test("concurrent peers preserve an unbroken chain of full inputs", () => fi
     const left = new PeerStorage(config, async () => {});
     const right = new PeerStorage({ ...config, name: crypto.randomUUID() }, async () => {});
     equal(await Promise.all([
-        left.put("tasks.md", { ctime: 0, mtime: 1791795000000, size: 9, data: ["left edit\n"] }),
-        right.put("tasks.md", { ctime: 0, mtime: 1791795000001, size: 10, data: ["right edit\n"] }),
+        left.put("tasks.md", { ctime: 0, mtime: 1791795000000, size: 9, data: ["left edit\n"] }, unguardedDelivery()),
+        right.put("tasks.md", { ctime: 0, mtime: 1791795000001, size: 10, data: ["right edit\n"] }, unguardedDelivery()),
     ]), [true, true]);
     const saved = await records(config);
     equal(saved.length, 2);
@@ -80,7 +83,7 @@ Deno.test("remote deletion leaves recoverable owner bytes and a deletion input",
     const path = join(config.baseDir, "tasks.md");
     await Deno.writeTextFile(path, "keep this owner task\n");
     const peer = new PeerStorage(config, async () => {});
-    equal(await peer.delete("tasks.md"), true);
+    equal(await peer.delete("tasks.md", unguardedDelivery()), true);
     const [record] = await records(config);
     equal(record.hash_incoming, null);
     equal(await Deno.readTextFile(join(config.writeProtocol!.versionsPath, "blobs", `${record.hash_before}.bin`)), "keep this owner task\n");
@@ -115,7 +118,7 @@ Deno.test("process crash after preservation leaves both inputs and permits retry
         equal(await Deno.readTextFile(path), "before crash\n");
         equal((await records(config)).length, 1);
         const peer = new PeerStorage(config, async () => {});
-        equal(await peer.put("tasks.md", { ctime: 0, mtime: 1791795000000, size: 12, data: ["after retry\n"] }), true);
+        equal(await peer.put("tasks.md", { ctime: 0, mtime: 1791795000000, size: 12, data: ["after retry\n"] }, unguardedDelivery()), true);
         equal(await Deno.readTextFile(path), "after retry\n");
         equal((await records(config)).length, 2);
     } finally {
@@ -134,14 +137,14 @@ Deno.test("replayed bytes are a no-op but owner changes are checked again", () =
     const path = join(config.baseDir, "tasks.md");
     await Deno.writeTextFile(path, "original\n");
     const peer = new PeerStorage(config, async () => {});
-    const incoming = { ctime: 0, mtime: 1791795000000, size: 9, data: ["incoming\n"] };
-    equal(await peer.put("tasks.md", incoming), true);
-    equal(await peer.put("tasks.md", incoming), false);
-    equal((await records(config)).length, 1);
+    const data = { ctime: 0, mtime: 1791795000000, size: 9, data: ["incoming\n"] };
+    equal(await peer.put("tasks.md", data, unguardedDelivery()), true);
+    equal(await peer.put("tasks.md", data, unguardedDelivery()), false);
+    equal((await records(config)).length, 2);
     await Deno.writeTextFile(path, "owner changed again\n");
-    equal(await peer.put("tasks.md", incoming), true);
+    equal(await peer.put("tasks.md", data, unguardedDelivery()), true);
     const saved = await records(config);
-    equal(saved.length, 2);
+    equal(saved.length, 3);
     const previous = await Promise.all(saved.map((record) =>
         Deno.readTextFile(join(config.writeProtocol!.versionsPath, "blobs", `${record.hash_before}.bin`))));
     equal(previous.includes("owner changed again\n"), true);
@@ -154,10 +157,10 @@ Deno.test("distinct remote revisions retain provenance even when bytes or absenc
     const origin: Origin = { peer: "remote", rev: "2-edit", winner: "2-edit",
         revisions: { start: 2, ids: ["edit", "initial"] }, base: null };
     const incoming = { ctime: 0, mtime: 1791795000000, size: 12, data: ["owner words\n"] };
-    equal(await peer.put("tasks.md", incoming, origin), false);
+    equal(await peer.put("tasks.md", incoming, unguardedDelivery(origin)), false);
     const reverted: Origin = { ...origin, rev: "3-revert", winner: "3-revert",
         revisions: { start: 3, ids: ["revert", "edit", "initial"] } };
-    equal(await peer.put("tasks.md", incoming, reverted), false);
+    equal(await peer.put("tasks.md", incoming, unguardedDelivery(reverted)), false);
     equal(await Deno.readTextFile(path), "owner words\n");
     const saved = await records(config);
     equal(saved.length, 2);
@@ -165,10 +168,10 @@ Deno.test("distinct remote revisions retain provenance even when bytes or absenc
     equal(saved.every(record => record.hash_before === record.hash_incoming), true);
     const deletion: Origin = { ...reverted, rev: "4-delete", winner: "4-delete",
         revisions: { start: 4, ids: ["delete", "revert", "edit", "initial"] } };
-    equal(await peer.delete("tasks.md", deletion), true);
+    equal(await peer.delete("tasks.md", unguardedDelivery(deletion)), true);
     const stillAbsent: Origin = { ...deletion, rev: "5-delete", winner: "5-delete", base: { rev: "4-delete", sha256: null },
         revisions: { start: 5, ids: ["delete", "delete", "revert", "edit", "initial"] } };
-    equal(await peer.delete("tasks.md", stillAbsent), false);
+    equal(await peer.delete("tasks.md", unguardedDelivery(stillAbsent)), false);
     const deleted = (await records(config)).find(record => record.origin.rev === "5-delete");
     equal(deleted.origin, stillAbsent);
     equal([deleted.hash_before, deleted.hash_incoming], [null, null]);
@@ -180,11 +183,11 @@ Deno.test("disk failure rejects the input and the same input can be retried", ()
     const peer = new PeerStorage(config, async () => {});
     const incoming = { ctime: 0, mtime: 1791795000000, size: 9, data: ["incoming\n"] };
     let rejected = false;
-    try { await peer.put("tasks.md", incoming); } catch { rejected = true; }
+    try { await peer.put("tasks.md", incoming, unguardedDelivery()); } catch { rejected = true; }
     equal(rejected, true);
     equal((await Deno.stat(path)).isDirectory, true);
     await Deno.remove(path);
-    equal(await peer.put("tasks.md", incoming), true);
+    equal(await peer.put("tasks.md", incoming, unguardedDelivery()), true);
     equal(await Deno.readTextFile(path), "incoming\n");
 }));
 
@@ -207,4 +210,33 @@ Deno.test("failed outbound dispatch retains the change for a retry", () => fixtu
     equal(attempts, 2);
     equal(accepted, [["new owner edit\n"]]);
     equal(await peer.isChanged("tasks.md"), false);
+}));
+
+Deno.test("a protected file takes only a delivery, and a delivery only a file the vault protects", () => fixture(async (_root, config) => {
+    const board = join(config.baseDir, "tasks.md");
+    const note = join(config.baseDir, "notes.md");
+    await Deno.writeTextFile(board, "owner board\n");
+    await Deno.writeTextFile(note, "owner note\n");
+    const unprotected = { ...config, name: crypto.randomUUID(), writeProtocol: undefined };
+    let applied = 0;
+    const counted: Delivery = { ...revision, apply: (write) => { applied++; return write(); } };
+    const data = { ctime: 0, mtime: 1791795000000, size: 9, data: ["incoming\n"] };
+    const refusals = [
+        () => new PeerStorage(config, async () => {}).put("tasks.md", data),
+        () => new PeerStorage(config, async () => {}).delete("tasks.md"),
+        () => new PeerStorage(config, async () => {}).put("notes.md", data, counted),
+        () => new PeerStorage(unprotected, async () => {}).put("tasks.md", data, counted),
+        () => new PeerStorage(unprotected, async () => {}).delete("tasks.md", counted),
+    ];
+    for (const refusal of refusals) {
+        let rejected = false;
+        try { await refusal(); } catch { rejected = true; }
+        equal(rejected, true);
+    }
+    equal([applied, await Deno.readTextFile(board), await Deno.readTextFile(note)], [0, "owner board\n", "owner note\n"]);
+    let recorded = false;
+    try { recorded = (await records(config)).length > 0; } catch (error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
+    equal(recorded, false);
+    equal(await new PeerStorage(config, async () => {}).put("notes.md", data), true);
+    equal(await Deno.readTextFile(note), "incoming\n");
 }));

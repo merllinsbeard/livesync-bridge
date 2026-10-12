@@ -1,6 +1,6 @@
 import { join } from "@std/path";
 import { PeerStorage } from "./PeerStorage.ts";
-import type { FileData, PeerStorageConf } from "./types.ts";
+import type { Delivery, FileData, PeerStorageConf } from "./types.ts";
 
 function equal(actual: unknown, expected: unknown) {
     if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -34,6 +34,8 @@ async function fixture(work: (config: PeerStorageConf, peers: PeerStorage[]) => 
 }
 
 const data = (text: string, mtime = 1000): FileData => ({ data: [text], ctime: mtime, mtime, size: new TextEncoder().encode(text).length });
+const unguardedDelivery = (rev: string): Delivery => ({ peer: "remote", rev, winner: rev, revisions: { start: 2, ids: [rev.slice(2), "base"] }, base: null,
+    apply: (write) => write() });
 const text = (value: FileData | false) => value === false ? false : value.data instanceof Uint8Array ? new TextDecoder().decode(value.data) : value.data.join("");
 
 for (const useChokidar of [true, false]) {
@@ -76,7 +78,7 @@ Deno.test("inbound replacement waits for the outbound read and send of the same 
     const send = peer.dispatch(path);
     try {
         await until(() => sending);
-        const incoming = peer.put("tasks.md", data("remote input\n"));
+        const incoming = peer.put("tasks.md", data("remote input\n"), unguardedDelivery("2-remote"));
         await new Promise(resolve => setTimeout(resolve, 40));
         equal(await Deno.readTextFile(path), "owner input\n");
         release();
@@ -97,7 +99,7 @@ Deno.test("accepted A then incoming B then local A is sent even with equal size 
     });
     peers.push(peer);
     await peer.dispatch(path);
-    await peer.put("tasks.md", data("B\n"));
+    await peer.put("tasks.md", data("B\n"), unguardedDelivery("2-b"));
     const stamp = (await Deno.stat(path)).mtime!;
     await Deno.writeTextFile(path, "A\n");
     await Deno.utime(path, stamp, stamp);

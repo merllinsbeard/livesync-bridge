@@ -5,7 +5,8 @@ import { createTextBlob, extractObject } from "@vrtmrz/livesync-commonlib/compat
 import { defaultLogger, setGlobalLogFunction } from "octagonal-wheels/common/logger";
 import { Hub } from "../../Hub.ts";
 import { CHANGES_SELECTOR, PeerCouchDB } from "../../PeerCouchDB.ts";
-import type { Config, FileData, Origin, PeerCouchDBConf } from "../../types.ts";
+import { PeerStorage } from "../../PeerStorage.ts";
+import type { Config, FileData, Origin, PeerCouchDBConf, PeerStorageConf } from "../../types.ts";
 
 const couchDbUrl = Deno.env.get("COUCHDB_URL") ?? "http://127.0.0.1:5989";
 const couchDbUsername = Deno.env.get("COUCHDB_USERNAME") ?? "admin";
@@ -506,9 +507,10 @@ recoveryTest("a vault edit based on a stale revision never overwrites a newer Co
     const bridge = new PeerCouchDB({
         ...couchConf(`bridge-cas-${crypto.randomUUID().slice(0, 8)}`, database),
         writeProtocol: { protectedPaths },
-    }, async (_source, path, data) => {
+    }, async (_source, path, data, delivery) => {
         await gate;
         if (data !== false) delivered.push(`${path}:${(data.data as string[]).join("")}`);
+        await delivery?.apply(() => Promise.resolve(true));
     });
     try {
         await mac.put("tasks.md", note("- [ ] base\n"));
@@ -1015,6 +1017,252 @@ recoveryTest("a bodiless deletion made while the bridge was down reaches the vau
         await waitFor("the board removed from the vault", async () => await readText(board) === undefined);
         assertEquals(removed.origin.base?.rev, base, "the deletion names the base the vault held");
         assertEquals(lineage(removed.origin)[1], base, "the deleted revision is the parent of the tombstone");
+    }));
+
+type Transit = {
+    database: string;
+    id: string;
+    board: string;
+    mac: PeerCouchDB;
+    storage: PeerStorage;
+    base(): { rev: string; sha256: string | null } | null;
+    checkpoint(): string | null;
+    held: Promise<void>;
+    releaseDeliveryAndStopBridge(): Promise<void>;
+};
+
+async function withDeliveryInTransit(name: string, holds: (data: FileData | false) => boolean, operation: (transit: Transit) => Promise<void>) {
+    const database = await createVaultDatabase();
+    const root = await Deno.makeTempDir({ prefix: "lsb-transit-" });
+    const fixture = new BridgeFixture(root, database);
+    const [couchPeer, storagePeer] = fixture.config().peers as [PeerCouchDBConf, PeerStorageConf];
+    await Deno.mkdir(fixture.vault, { recursive: true });
+    const mac = await startedPeer(couchConf(`mac-${name}-${crypto.randomUUID().slice(0, 8)}`, database));
+    const held = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    const answered = Promise.withResolvers<void>();
+    let holding = true;
+    let stopped = false;
+    const storage = new PeerStorage(storagePeer, async (_source, path, data) => {
+        if (data === false) await bridge.delete(path);
+        else await bridge.put(path, data);
+    });
+    const bridge = new PeerCouchDB(couchPeer, async (_source, path, data, origin) => {
+        const hold = holding && origin !== undefined && holds(data);
+        if (hold) {
+            holding = false;
+            held.resolve();
+            await released.promise;
+        }
+        try {
+            if (data === false) await storage.delete(path, origin);
+            else await storage.put(path, data, origin);
+        } finally {
+            if (hold) answered.resolve();
+        }
+    });
+    try {
+        const board = join(fixture.vault, "tasks.md");
+        await mac.put("tasks.md", note("- [ ] base\n"));
+        await bridge.start();
+        assertEquals(await readText(board), "- [ ] base\n", "the base board reaches the vault");
+        await operation({
+            database, board, mac, storage, held: held.promise,
+            id: await mac.man.path2id("tasks.md" as FilePathWithPrefix),
+            base: () => JSON.parse(bridge.getSetting("rev-tasks.md") ?? "null"),
+            checkpoint: () => bridge.getSetting("since"),
+            releaseDeliveryAndStopBridge: async () => {
+                released.resolve();
+                await answered.promise;
+                stopped = true;
+                await bridge.stop();
+            },
+        });
+    } finally {
+        released.resolve();
+        await storage.stop();
+        if (!stopped) await bridge.stop();
+        await mac.stop();
+        await couch(`/${database}`, { method: "DELETE" });
+        await Deno.remove(root, { recursive: true });
+    }
+}
+
+const checkedInTransit = "- [x] base\n";
+const holdsChecked = (data: FileData | false) => data !== false && (data.data as string[]).join("") === checkedInTransit;
+
+recoveryTest("a vault save matching a CouchDB winner still in transit confirms that winner as the verified base", () =>
+    withDeliveryInTransit("matching-save", holdsChecked, async ({ database, id, board, mac, storage, base, held, releaseDeliveryAndStopBridge }) => {
+        await mac.put("tasks.md", note(checkedInTransit));
+        await held;
+        const checked = { rev: (await winner(database, id))._rev, sha256: await sha256Text(checkedInTransit) };
+        await Deno.writeTextFile(board, checkedInTransit);
+        await storage.dispatch(board);
+        assertEquals(JSON.stringify(base()), JSON.stringify(checked), "the matching vault save confirms the winner it matches");
+
+        await releaseDeliveryAndStopBridge();
+        assertEquals(await readText(board), checkedInTransit, "the vault keeps the winner's bytes");
+        assertEquals(JSON.stringify(base()), JSON.stringify(checked), "the delivery leaves the confirmed base in place");
+        assert(!await storage.isChanged("tasks.md"), "the vault side records the board as synced");
+    }));
+
+recoveryTest("a CouchDB winner delayed in transit never replaces a newer vault revision confirmed meanwhile", () =>
+    withDeliveryInTransit("delayed-winner", holdsChecked, async ({ database, id, board, mac, storage, base, held, releaseDeliveryAndStopBridge }) => {
+        await mac.put("tasks.md", note(checkedInTransit));
+        await held;
+        await Deno.writeTextFile(board, checkedInTransit);
+        await storage.dispatch(board);
+        const newer = "- [x] base\n- [ ] added in the vault after the check\n";
+        await Deno.writeTextFile(board, newer);
+        await storage.dispatch(board);
+        assertEquals((await mac.get("tasks.md" as FilePathWithPrefix) as FileData).data.join(""), newer, "CouchDB holds the newer vault revision");
+        const confirmed = { rev: (await winner(database, id))._rev, sha256: await sha256Text(newer) };
+        assertEquals(JSON.stringify(base()), JSON.stringify(confirmed), "the newer vault revision is the verified base");
+
+        await releaseDeliveryAndStopBridge();
+        assertEquals(await readText(board), newer, "the delayed winner must not replace the newer confirmed vault revision");
+        assertEquals(JSON.stringify(base()), JSON.stringify(confirmed), "the base stays on the newer vault revision");
+        assert(!await storage.isChanged("tasks.md"), "the vault side still records the newer revision as synced");
+        assertEquals((await liveLeaves(database, id)).length, 1, "no sibling revision may appear");
+    }));
+
+recoveryTest("a CouchDB deletion delayed in transit never removes a vault board recreated and confirmed meanwhile", () =>
+    withDeliveryInTransit("delayed-deletion", (data) => data === false, async ({ database, id, board, mac, storage, base, held, releaseDeliveryAndStopBridge }) => {
+        assert(await mac.delete("tasks.md"), "the Mac should delete the board");
+        await held;
+        const deletion = (await winner(database, id))._rev;
+        await Deno.remove(board);
+        await storage.dispatch(board);
+        assertEquals(JSON.stringify(base()), JSON.stringify({ rev: deletion, sha256: null }), "the vault deletion confirms the CouchDB deletion as the base");
+        const recreated = "- [ ] recreated in the vault\n";
+        await Deno.writeTextFile(board, recreated);
+        await storage.dispatch(board);
+        assertEquals((await mac.get("tasks.md" as FilePathWithPrefix) as FileData).data.join(""), recreated, "CouchDB holds the recreated board");
+        const confirmed = { rev: (await winner(database, id))._rev, sha256: await sha256Text(recreated) };
+        assertEquals(JSON.stringify(base()), JSON.stringify(confirmed), "the recreated board is the verified base");
+
+        await releaseDeliveryAndStopBridge();
+        assertEquals(await readText(board), recreated, "the delayed deletion must not remove the recreated confirmed board");
+        assertEquals(JSON.stringify(base()), JSON.stringify(confirmed), "the base stays on the recreated board");
+        assert(!await storage.isChanged("tasks.md"), "the vault side still records the recreated board as synced");
+    }));
+
+recoveryTest("a CouchDB winner delayed in transit never takes the base back from a later vault revision with the same bytes", () =>
+    withDeliveryInTransit("same-bytes-later", holdsChecked, async ({ database, id, board, mac, storage, base, held, releaseDeliveryAndStopBridge }) => {
+        await mac.put("tasks.md", note(checkedInTransit));
+        await held;
+        const delayed = (await winner(database, id))._rev;
+        for (const text of [checkedInTransit, "- [x] base\n- [ ] briefly added in the vault\n", checkedInTransit]) {
+            await Deno.writeTextFile(board, text);
+            await storage.dispatch(board);
+        }
+        const confirmed = { rev: (await winner(database, id))._rev, sha256: await sha256Text(checkedInTransit) };
+        assert(confirmed.rev !== delayed, "the vault stored the delayed winner's bytes again as a later revision");
+        assertEquals(JSON.stringify(base()), JSON.stringify(confirmed), "that later vault revision is the verified base");
+
+        await releaseDeliveryAndStopBridge();
+        assertEquals(await readText(board), checkedInTransit, "the vault keeps the bytes both revisions share");
+        assertEquals(JSON.stringify(base()), JSON.stringify(confirmed), "the delayed winner must not take the base back to its older revision");
+        assert(!await storage.isChanged("tasks.md"), "the vault side records the board as synced");
+    }));
+
+const unconfirmedVaultEdit = "- [x] base\n- [ ] edited in the vault\n";
+
+// Runs `statement` on a Mac peer in a process of its own, as the Mac is: in this process it would wait for the
+// LiveSync file lock the bridge holds while its reply is held.
+async function inMacProcess(database: string, statement: string) {
+    const conf = couchConf(`mac-process-${crypto.randomUUID().slice(0, 8)}`, database);
+    const { code, stderr } = await new Deno.Command(Deno.execPath(), {
+        args: ["eval", "--location", `http://${conf.name}.test`, `
+            import { PeerCouchDB } from ${JSON.stringify(new URL("../../PeerCouchDB.ts", import.meta.url).href)};
+            const mac = new PeerCouchDB(${JSON.stringify(conf)}, () => Promise.resolve());
+            await mac.start();
+            try { ${statement} } finally { await mac.stop(); }`],
+        cwd: repositoryRoot, stdout: "null", stderr: "piped",
+    }).output();
+    assert(code === 0, `the Mac process failed:\n${new TextDecoder().decode(stderr).slice(-3000)}`);
+}
+
+async function changeOverUnconfirmedVaultEdit(transit: Transit, macStatement: string, matchesWinnerRequest: (query: URLSearchParams) => boolean) {
+    const { database, id, board, mac, storage, base, checkpoint } = transit;
+    const network = globalThis.fetch;
+    let feedsWaiting = 0;
+    let holdingFeeds = true;
+    let holdingReply = false;
+    let replyHeld = false;
+    let watchingRead = false;
+    let winnerRequestStarted = false;
+    const feedsGo = Promise.withResolvers<void>();
+    const replyGoes = Promise.withResolvers<void>();
+    globalThis.fetch = async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        const ofBoard = decodeURIComponent(url.pathname).endsWith(`/${id}`);
+        if (holdingFeeds && url.pathname.endsWith("/_changes") && url.searchParams.get("filter") === "_selector") {
+            feedsWaiting++;
+            await feedsGo.promise;
+        }
+        if (watchingRead && method === "GET" && ofBoard && matchesWinnerRequest(url.searchParams)) {
+            watchingRead = false;
+            winnerRequestStarted = true;
+        }
+        const response = await network(input, init);
+        if (holdingReply && method === "PUT" && ofBoard) {
+            holdingReply = false;
+            replyHeld = true;
+            await replyGoes.promise;
+        }
+        return response;
+    };
+    let saving: Promise<void> | undefined;
+    try {
+        const confirmed = JSON.stringify(base());
+        await mac.put("other.md", note("- [ ] passed by both changes feeds before the board changes\n"));
+        await waitFor("the next request of both changes feeds", () => feedsWaiting >= 2);
+        holdingReply = true;
+        await Deno.writeTextFile(board, unconfirmedVaultEdit);
+        saving = storage.dispatch(board);
+        await waitFor("CouchDB's reply to the vault edit", () => replyHeld);
+        assertEquals(JSON.stringify(base()), confirmed, "the bridge has not yet confirmed the vault edit CouchDB stored");
+        await inMacProcess(database, macStatement);
+        const head = await updateSeq(database);
+        watchingRead = true;
+        holdingFeeds = false;
+        feedsGo.resolve();
+        await waitFor("the bridge's read of the changed board", () => winnerRequestStarted);
+        replyGoes.resolve();
+        await saving;
+        await waitFor("the checkpoint past the Mac change", () => seqNumber(checkpoint()) >= seqNumber(head));
+    } finally {
+        holdingFeeds = holdingReply = watchingRead = false;
+        feedsGo.resolve();
+        replyGoes.resolve();
+        await saving?.catch(() => {});
+        globalThis.fetch = network;
+    }
+}
+
+recoveryTest("a Mac edit over a vault edit the bridge has not confirmed yet reaches the vault, though it is the feed's last change", () =>
+    withDeliveryInTransit("over-unconfirmed-edit", () => false, async (transit) => {
+        const { database, id, board, storage, base } = transit;
+        const newer = "- [x] base\n- [ ] edited in the vault\n- [ ] added on the Mac\n";
+        await changeOverUnconfirmedVaultEdit(transit, `await mac.put("tasks.md", ${JSON.stringify(note(newer))});`, (query) => query.has("conflicts"));
+        const macRevision = { rev: (await winner(database, id))._rev, sha256: await sha256Text(newer) };
+        assertEquals(await readText(board), newer, "the Mac edit reaches the vault before its change is checkpointed");
+        assertEquals(JSON.stringify(base()), JSON.stringify(macRevision), "the Mac edit is the verified base");
+        assert(!await storage.isChanged("tasks.md"), "the vault side records the Mac edit as synced");
+    }));
+
+recoveryTest("a Mac deletion that removes the metadata over a vault edit the bridge has not confirmed yet reaches the vault, though it is the feed's last change", () =>
+    withDeliveryInTransit("over-unconfirmed-delete", () => false, async (transit) => {
+        const { database, id, board, storage, base } = transit;
+        await changeOverUnconfirmedVaultEdit(transit, `mac.man.services.setting.settings.deleteMetadataOfDeletedFiles = true;
+            if (!await mac.delete("tasks.md")) throw new Error("the Mac did not delete the board");`, (query) => query.size === 0);
+        const [tombstone] = await liveLeaves(database, id);
+        assert(tombstone?.deleted, `the board should now be a tombstone, got ${JSON.stringify(tombstone)}`);
+        assertEquals(await readText(board), undefined, "the Mac deletion reaches the vault before its change is checkpointed");
+        assertEquals(JSON.stringify(base()), JSON.stringify({ rev: tombstone.rev, sha256: null }), "the deletion is the verified base");
+        assertEquals(storage.getSetting(`file-stat-${storage.toLocalPath("tasks.md")}`), null, "the vault side no longer records the board");
     }));
 
 recoveryTest("teardown", () => {
