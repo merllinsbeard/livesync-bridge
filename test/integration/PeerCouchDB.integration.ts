@@ -23,6 +23,7 @@ async function waitForCouchDb(): Promise<void> {
     while (Date.now() < deadline) {
         try {
             const response = await fetch(`${couchDbUrl}/_up`, { headers: { authorization: authHeader } });
+            await response.body?.cancel();
             if (response.ok) return;
         } catch {
             // CouchDB is still starting.
@@ -111,8 +112,7 @@ Deno.test("PeerCouchDB exchanges files with distinct content and path passphrase
         );
     } finally {
         await Promise.allSettled([peerA.stop(), peerB.stop()]);
-        await Promise.allSettled([peerA.man?.close(), peerB.man?.close()]);
         setGlobalLogFunction(defaultLogger);
-        await requestDatabase(database, "DELETE");
+        await (await requestDatabase(database, "DELETE")).body?.cancel();
     }
 });
