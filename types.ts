@@ -5,6 +5,21 @@ export interface Config {
 }
 export type PeerConf = PeerStorageConf | PeerCouchDBConf;
 
+export type CouchRevisions = { start: number; ids: string[] };
+export type Origin = {
+    peer: string;
+    rev: string;
+    revisions: CouchRevisions;
+    winner: string;
+    base: { rev: string; sha256: string | null } | null;
+};
+export type Delivery = Origin & {
+    // Runs `write` only while the vault's verified base is still the one this revision was checked against, and then
+    // makes this revision the base. Once the vault has confirmed another revision, it resolves false without running
+    // `write`, and the CouchDB peer reads its winner again.
+    apply(write: () => Promise<boolean>): Promise<boolean>;
+};
+
 export interface PeerStorageConf {
     scanOfflineChanges?: boolean;
     type: "storage";
@@ -16,10 +31,20 @@ export interface PeerStorageConf {
         args: string[]
     }
     useChokidar?: boolean;
+    writeProtocol?: {
+        lockPath: string;
+        versionsPath: string;
+        protectedPaths: string[];
+    };
 }
 export interface PeerCouchDBConf extends DirectFileManipulatorOptions {
     /** Glob patterns for i:-prefixed (internal) files to sync, e.g. [".claude/**"] */
     includeInternal?: string[];
+    writeProtocol?: {
+        protectedPaths: string[];
+        versionsPath?: string;
+        initialSince?: string;
+    };
     type: "couchdb";
     useRemoteTweaks?: true;
     group?: string;

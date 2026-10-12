@@ -1,11 +1,11 @@
 import { join as joinPosix } from "@std/path/posix";
 import type { FilePathWithPrefix } from "@vrtmrz/livesync-commonlib/compat/common/types";
-import { PeerConf, FileData } from "./types.ts";
+import { PeerConf, FileData, type Delivery } from "./types.ts";
 import { Logger, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, type LOG_LEVEL } from "octagonal-wheels/common/logger";
 import { LRUCache } from "octagonal-wheels/memory/LRUCache";
 import { computeHash } from "./util.ts";
 
-export type DispatchFun = (source: Peer, path: string, data: FileData | false) => Promise<void>;
+export type DispatchFun = (source: Peer, path: string, data: FileData | false, delivery?: Delivery) => Promise<void>;
 
 export interface PeerHealth {
     name: string;
@@ -85,8 +85,8 @@ export abstract class Peer {
         // this.debugLog(`**TOLOCAL: ${pathSrc} => ${path}`);
         return path;
     }
-    abstract delete(path: string): Promise<boolean>;
-    abstract put(path: string, data: FileData): Promise<boolean>;
+    abstract delete(path: string, delivery?: Delivery): Promise<boolean>;
+    abstract put(path: string, data: FileData, delivery?: Delivery): Promise<boolean>;
     abstract get(path: FilePathWithPrefix): Promise<false | FileData>;
     abstract start(): Promise<void>;
     abstract stop(): Promise<void>;

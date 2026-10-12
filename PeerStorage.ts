@@ -1,20 +1,25 @@
-import { PeerStorageConf, FileData } from "./types.ts";
-import { delay, getDocData } from "@vrtmrz/livesync-commonlib/compat/common/utils";
+import { PeerStorageConf, FileData, type Delivery, type Origin } from "./types.ts";
+import { getDocData } from "@vrtmrz/livesync-commonlib/compat/common/utils";
 import { isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/path";
-import { parse, format, relative, dirname, resolve } from "@std/path";
+import { parse, format, relative, resolve } from "@std/path";
 import { format as posixFormat, parse as posixParse } from "@std/path/posix";
-import { scheduleOnceIfDuplicated } from "octagonal-wheels/concurrency/lock";
+import { serialized } from "octagonal-wheels/concurrency/lock";
 import { DispatchFun, Peer, PeerHealth } from "./Peer.ts";
 import chokidar from "chokidar";
 import { walk } from "fs/walk";
+import { replaceStorageFile, StorageWriteProtocol } from "./StorageWriteProtocol.ts";
 
-import { scheduleTask } from "octagonal-wheels/concurrency/task";
+import { cancelTask, scheduleTask } from "octagonal-wheels/concurrency/task";
+import { computeHash } from "./util.ts";
+import { minimatch } from "minimatch";
 import {
     Logger,
     LOG_LEVEL_INFO,
     LOG_LEVEL_NOTICE,
     LOG_LEVEL_VERBOSE,
 } from "octagonal-wheels/common/logger";
+
+type PendingPath = { requested: number; since: number; attempts: number; reason: string; running?: Promise<void> };
 
 export class PeerStorage extends Peer {
     declare config: PeerStorageConf;
@@ -24,56 +29,85 @@ export class PeerStorage extends Peer {
         super(conf, dispatcher);
     }
 
-    async delete(pathSrc: string): Promise<boolean> {
+    async delete(pathSrc: string, delivery?: Delivery): Promise<boolean> {
+        return await this.section(pathSrc, () => this.applyIncoming(pathSrc, delivery, (origin) => this.deleteLocked(pathSrc, origin)));
+    }
+    private async applyIncoming(pathSrc: string, delivery: Delivery | undefined, write: (origin?: Origin) => Promise<boolean>): Promise<boolean> {
+        const protocol = new StorageWriteProtocol(this.config);
+        if (!delivery) {
+            if (this.isProtected(pathSrc)) throw new Error(`${pathSrc} is protected; a change that does not carry its CouchDB revision is not written`);
+            return await protocol.locked(() => write());
+        }
+        if (!this.isProtected(pathSrc)) throw new Error(`${pathSrc} came as a protected CouchDB revision, but this vault does not protect it; it is not written`);
+        return await delivery.apply(() => protocol.locked(() => write(delivery)));
+    }
+    private async deleteLocked(pathSrc: string, origin?: Origin): Promise<boolean> {
         const lp = this.toLocalPath(pathSrc);
         const path = this.toStoragePath(lp);
-        if (await this.isRepeating(lp, false)) {
-            return false;
-        }
         try {
-            await Deno.remove(path);
+            try {
+                await Deno.stat(path);
+            } catch (error) {
+                if (error instanceof Deno.errors.NotFound) {
+                    if (origin) await new StorageWriteProtocol(this.config).preserve(path, null, null, origin);
+                    localStorage.removeItem(this._getKey(`file-stat-${lp}`));
+                    return false;
+                }
+                throw error;
+            }
+            const protocol = new StorageWriteProtocol(this.config);
+            await protocol.preserve(path, null, null, origin);
+            await protocol.remove(path);
+            try {
+                await Deno.stat(path);
+                throw new Error("Deleted file remains on disk");
+            } catch (error) {
+                if (!(error instanceof Deno.errors.NotFound)) throw error;
+            }
             this.receiveLog(` ${path} deleted`);
+            localStorage.removeItem(this._getKey(`file-stat-${lp}`));
         } catch (ex) {
+            this.cache.set(lp, "");
             this.receiveLog(` ${path} delete failed`, LOG_LEVEL_NOTICE);
             Logger(ex, LOG_LEVEL_VERBOSE);
-            return false;
+            throw ex;
         }
         this.runScript(path, true);
         return true;
     }
-    async put(pathSrc: string, data: FileData): Promise<boolean> {
+    async put(pathSrc: string, data: FileData, delivery?: Delivery): Promise<boolean> {
+        return await this.section(pathSrc, () => this.applyIncoming(pathSrc, delivery, (origin) => this.putLocked(pathSrc, data, origin)));
+    }
+    private async putLocked(pathSrc: string, data: FileData, origin?: Origin): Promise<boolean> {
         const lp = this.toLocalPath(pathSrc);
         const path = this.toStoragePath(lp);
-        if (await this.isRepeating(lp, data)) {
-            this.receiveLog(`${lp} save repeating`);
-            return false;
-        }
         try {
-            const dirName = dirname(path);
-            try {
-                await Deno.mkdir(dirName, { recursive: true });
-            } catch (ex) {
-                // While recursive is true, mkdir will not raise the `AlreadyExist`.
-                console.log(ex);
+            const bytes = data.data instanceof Uint8Array ? data.data : new TextEncoder().encode(getDocData(data.data));
+            if (bytes.length === 0 && data.size > 0) throw new Error("Empty payload for a nonempty document");
+            const previous = await Deno.readFile(path).catch((error) => {
+                if (error instanceof Deno.errors.NotFound) return null;
+                throw error;
+            });
+            if (previous && previous.length === bytes.length && previous.every((byte, index) => byte === bytes[index])) {
+                if (origin) await new StorageWriteProtocol(this.config).preserve(path, bytes, data.mtime, origin);
+                await this.writeFileStat(pathSrc);
+                return false;
             }
-            const fp = await Deno.open(path, { read: true, write: true, create: true });
-            if (data.data instanceof Uint8Array) {
-                const writtensize = await fp.write(data.data);
-                await fp.truncate(writtensize);
-            } else {
-                const writtensize = await fp.write(new TextEncoder().encode(getDocData(data.data)));
-                await fp.truncate(writtensize);
+            await new StorageWriteProtocol(this.config).preserve(path, bytes, data.mtime, origin);
+            await replaceStorageFile(path, bytes, data.mtime);
+            const accepted = await Deno.readFile(path);
+            if (accepted.length !== bytes.length || !accepted.every((byte, index) => byte === bytes[index])) {
+                throw new Error("Storage readback differs from the incoming bytes");
             }
-            await fp.utime(new Date(data.mtime), new Date(data.mtime));
-            fp.close();
             this.receiveLog(`${lp} saved`);
             await this.writeFileStat(pathSrc);
             this.runScript(path, false);
             return true;
         } catch (ex) {
+            this.cache.set(lp, "");
             Logger(ex, LOG_LEVEL_INFO);
             this.receiveLog(`${lp} save failed`);
-            return false;
+            throw ex;
         }
     }
 
@@ -81,9 +115,7 @@ export class PeerStorage extends Peer {
         if (!this.config.processor) return false;
         if (!this.config.processor.cmd) return false;
 
-        // const result = [];
         try {
-            // const startDate = new Date();
             const cmd = this.config.processor.cmd;
             const mode = isDeleted ? "deleted" : "modified";
             const args = this.config.processor.args.map(e => {
@@ -91,7 +123,6 @@ export class PeerStorage extends Peer {
                 if (e == "$mode") return mode;
                 return e
             });
-            // const dateStr = startDate.toLocaleString();
             const scriptLineMessage = `Script: called ${cmd} with args ${JSON.stringify(args)}`;
             this.normalLog(`Processor : ${scriptLineMessage}`)
             const command = new Deno.Command(
@@ -103,32 +134,19 @@ export class PeerStorage extends Peer {
                     mode: mode
                 }
             });
-            // const start = performance.now();
             const { code, stdout, stderr } = await command.output();
-            // const end = performance.now();
             const stdoutText = new TextDecoder().decode(stdout);
             const stderrText = new TextDecoder().decode(stderr);
-            // result.push(`# Processor called: ${dateStr}\n`);
-            // result.push(`command: \`${scriptLineMessage}\``);
             if (code === 0) {
                 this.normalLog("Processor called: Performed successfully.")
-                // result.push("Processor called: Performed successfully.")
                 this.normalLog(stdoutText);
             } else {
                 this.normalLog("Processor called: Performed but with some errors.")
-                // result.push("Processor called: Performed but with some errors.")
                 this.normalLog(stderrText, LOG_LEVEL_NOTICE);
             }
-            // result.push(`\n- Spent ${Math.ceil(end - start) / 1000} ms`);
-            // result.push("## --STDOUT--\n")
-            // result.push("```\n" + stdoutText + "\n```");
-            // result.push("## --STDERR--n")
-            // result.push("```\n" + stderrText + "\n```");
-            // const strResult = result.join("\n");
             return true;
         } catch (ex) {
             this.normalLog("Processor: Error on processing");;
-            // this.normalLog(ex);
             this.normalLog(JSON.stringify(ex, null, 2));
             return false;
         }
@@ -162,227 +180,254 @@ export class PeerStorage extends Peer {
         try {
             await watcher.close();
         } catch (ex) {
-            // Chokidar may already have closed the watcher after an error.
             Logger(ex, LOG_LEVEL_VERBOSE);
         }
     }
 
-    async dispatch(pathSrc: string) {
-        const lP = this.toStoragePath(this.toLocalPath("."));
-        const path = this.toPosixPath(relative(lP, pathSrc));
+    private epoch = 0;
+    private run?: number;
+    private readonly instance = crypto.randomUUID();
+    private pending = new Map<string, PendingPath>();
 
-        const data = await this.get(path);
-
-        if (data === false) return;
-
-        scheduleOnceIfDuplicated(pathSrc, async () => {
-            // console.log(data);
-            await this.writeFileStat(path);
-            await delay(250);
-            if (!await this.isRepeating(path, data)) {
-                this.sendLog(`${path} change detected`);
-                await this.dispatchToHub(this, this.toGlobalPath(path), data);
-            }
-            // else {
-            //     this.sendLog(`${path} change repeating detected`);
-            // }
-        });
+    private section<T>(path: string, operation: () => Promise<T>): Promise<T> {
+        return serialized(`storage-path:${this.toStoragePath(this.toLocalPath(path))}`, operation);
     }
-    async dispatchDeleted(pathSrc: string) {
-        const lP = this.toStoragePath(this.toLocalPath("."));
-        const path = this.toPosixPath(relative(lP, pathSrc));
-        await scheduleOnceIfDuplicated(pathSrc, async () => {
-            await delay(250);
-            if (!await this.isRepeating(path, false)) {
-                this.sendLog(`${path} delete detected`);
-                await this.dispatchToHub(this, this.toGlobalPath(path), false);
+
+    private relativePath(absolutePath: string): string {
+        const path = this.toPosixPath(relative(this.toStoragePath(this.toLocalPath(".")), resolve(absolutePath)));
+        if (path === ".." || path.startsWith("../")) throw new Error("Path is outside the storage root");
+        return path || ".";
+    }
+
+    private isProtected(path: string): boolean {
+        return this.config.writeProtocol?.protectedPaths.some(pattern => minimatch(path, pattern)) ?? false;
+    }
+
+    private async fileStat(path: string, data: FileData): Promise<string> {
+        return `${data.mtime}-${data.size}${this.isProtected(path) ? ":" + await computeHash(data.data) : ""}`;
+    }
+
+    private async forward(path: string, run?: number): Promise<void> {
+        if (run !== undefined && run !== this.run) return;
+        const snapshot = await new StorageWriteProtocol(this.config).locked(async () => {
+            try { return await this.get(path); }
+            catch (error) {
+                if (!(error instanceof Deno.errors.NotFound)) throw error;
+                const root = await Deno.stat(this.toStoragePath(this.toLocalPath(".")));
+                if (!root.isDirectory) throw new Error("Storage root is unavailable");
+                return null;
             }
         });
+        const statKey = `file-stat-${this.toLocalPath(path)}`;
+        const absentKey = this._getKey(`watch-pending-${path}`);
+        if (run !== undefined && run !== this.run) return;
+        if (snapshot === false) {
+            const absolutePath = this.toStoragePath(this.toLocalPath(path));
+            if (run !== undefined && (await Deno.stat(absolutePath)).isDirectory) await this.scanDirectory(absolutePath, run);
+            return;
+        }
+        if (snapshot === null) {
+            localStorage.setItem(absentKey, "1");
+            this.sendLog(`${path} delete detected`);
+            await this.dispatchToHub(this, this.toGlobalPath(path), false);
+            if (run !== undefined && run !== this.run) return;
+            localStorage.removeItem(this._getKey(statKey));
+        } else {
+            const stat = await this.fileStat(path, snapshot);
+            if (run !== undefined && run !== this.run) return;
+            if (this.getSetting(statKey) !== stat) {
+                this.sendLog(`${path} change detected`);
+                await this.dispatchToHub(this, this.toGlobalPath(path), snapshot);
+                if (run !== undefined && run !== this.run) return;
+                this.setSetting(statKey, stat);
+            }
+        }
+        localStorage.removeItem(absentKey);
+    }
 
+    async dispatch(pathSrc: string): Promise<void> {
+        const path = this.relativePath(pathSrc);
+        await this.section(path, () => this.forward(path));
+    }
+
+    async dispatchDeleted(pathSrc: string): Promise<void> {
+        await this.dispatch(pathSrc);
+    }
+
+    private timerKey(path: string, run: number): string {
+        return `storage-watch:${this.instance}:${run}:${path}`;
+    }
+
+    private arm(path: string, run: number, wait: number): void {
+        scheduleTask(this.timerKey(path, run), wait, () => this.attempt(path, run), true);
+    }
+
+    private notice(pathSrc: string, run: number): void {
+        if (run !== this.run || pathSrc.split(/[\\/]/).at(-1)?.startsWith(".otask-tmp-")) return;
+        try {
+            const path = this.relativePath(pathSrc);
+            let entry = this.pending.get(path);
+            if (!entry) {
+                entry = { requested: 0, since: Date.now(), attempts: 0, reason: "" };
+                this.pending.set(path, entry);
+            }
+            entry.requested++;
+            if (!entry.running) this.arm(path, run, 250);
+        } catch (error) { Logger(error, LOG_LEVEL_NOTICE); }
+    }
+
+    private async attempt(path: string, run: number): Promise<void> {
+        const entry = this.pending.get(path);
+        if (run !== this.run || !entry || entry.running) return;
+        const requested = entry.requested;
+        const work = this.section(path, () => this.forward(path, run));
+        entry.running = work;
+        let wait = 250;
+        try {
+            await work;
+            if (run !== this.run) return;
+            entry.attempts = 0;
+            entry.reason = "";
+            if (entry.requested === requested) this.pending.delete(path);
+        } catch (error) {
+            if (run !== this.run) return;
+            const reason = error instanceof Error ? error.message : String(error);
+            if (entry.reason !== reason) this.sendLog(`${path} not synced: ${reason}`, LOG_LEVEL_NOTICE);
+            entry.reason = reason;
+            entry.attempts++;
+            wait = Math.min(1000 * 2 ** Math.min(entry.attempts - 1, 6), 60000);
+        } finally {
+            entry.running = undefined;
+            if (run === this.run && this.pending.get(path) === entry) this.arm(path, run, wait);
+        }
     }
 
     toPosixPath(path: string) {
         const ret = posixFormat(parse(path));
-        // this.debugLog(`**TOPOSIX ${path} -> ${ret}`)
         return ret;
     }
     toStoragePath(path: string) {
         const ret = resolve(format(posixParse(path)));
-        // this.debugLog(`**TOSTORAGE ${path} -> ${ret}`)
         return ret;
     }
 
-    async writeFileStat(pathSrc: string, statSrc?: Deno.FileInfo) {
-        const lp = this.toLocalPath(pathSrc);
-        const key = `file-stat-${lp}`;
-        const path = this.toStoragePath(lp);
-        const stat = statSrc ?? await Deno.stat(path);
-        if (!stat.isFile) {
-            return false;
-        }
-        const fileStat = `${stat.mtime?.getTime() ?? 0}-${stat.size}`;
-        this.setSetting(key, fileStat);
+    async writeFileStat(pathSrc: string) {
+        const data = await this.get(pathSrc);
+        if (data === false) return false;
+        this.setSetting(`file-stat-${this.toLocalPath(pathSrc)}`, await this.fileStat(pathSrc, data));
     }
 
     async isChanged(pathSrc: string) {
-        const lp = this.toLocalPath(pathSrc);
-        const key = `file-stat-${lp}`;
-        const last = this.getSetting(key);
-        // console.log(`R:${key}`);
-        // console.log(`RV:${last}`);
-
-        const path = this.toStoragePath(lp);
-        const stat = await Deno.stat(path);
-        if (!stat.isFile) {
-            return false;
-        }
-        if (!last) return true;
-        const fileStat = `${stat.mtime?.getTime() ?? 0}-${stat.size}`;
-        // console.log(`RVX:${fileStat}`);
-        if (last !== fileStat) return true;
-        return false;
+        const data = await this.get(pathSrc);
+        return data !== false && this.getSetting(`file-stat-${this.toLocalPath(pathSrc)}`) !== await this.fileStat(pathSrc, data);
     }
+
     watcherDeno?: Deno.FsWatcher;
+    private watcherDrain?: Promise<void>;
 
     processFile(event: Deno.FsEvent) {
-        for (const path of event.paths) {
-            const key = `${event.kind}-${path}`;
-            // const key = path;
-            scheduleTask(key, 100, async () => {
-                const existence = await Deno.stat(path).catch(() => null);
-                if (existence) {
-                    if (existence.isFile) {
-                        await this.dispatch(path);
-                    }
-                } else {
-                    await this.dispatchDeleted(path);
-                }
-            });
+        if (this.run === undefined) return;
+        if (event.flag === "rescan") this.notice(this.toStoragePath(this.toLocalPath(".")), this.run);
+        for (const path of event.paths) this.notice(path, this.run);
+    }
+
+    private async scanDirectory(path: string, run: number): Promise<void> {
+        for await (const entry of walk(path)) {
+            if (run !== this.run) break;
+            if (entry.isFile) this.notice(entry.path, run);
         }
     }
 
-
-
-    async startDenoFsWatch(): Promise<void> {
-        if (this.watcherDeno) {
-            const watcher = this.watcherDeno;
-            this.watcherDeno = undefined;
-            try {
-                watcher.close();
-            } catch (ex) {
-                // Closing a watcher more than once is harmless for its lifecycle.
-                Logger(ex, LOG_LEVEL_VERBOSE);
-            }
+    private restoreAbsent(run: number): void {
+        const prefix = this._getKey("watch-pending-");
+        const paths: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key?.startsWith(prefix)) paths.push(key.substring(prefix.length));
         }
-        const lP = this.toStoragePath(this.toLocalPath("."));
-        this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
-        if (this.config.scanOfflineChanges) {
-            for await (const entry of walk(lP)) {
-                if (entry.isFile) {
-                    const ePath = this.toPosixPath(relative(this.toLocalPath("."), entry.path));
-                    if (await this.isChanged(ePath)) {
-                        this.debugLog(`Offline changes detected: ${ePath}`);
-                        await this.dispatch(entry.path);
-                    }
-                }
-            }
-        }
-        const watcher = Deno.watchFs(lP,
-            {
-                recursive: true,
-            });
-        this.watcherDeno = watcher;
-
-        try {
-            for await (const event of watcher) {
-                this.processFile(event);
-            }
-        } finally {
-            if (this.watcherDeno === watcher) {
-                this.watcherDeno = undefined;
-            }
-            try {
-                watcher.close();
-            } catch (ex) {
-                // The watcher can already be closed by stop() or a concurrent start().
-                Logger(ex, LOG_LEVEL_VERBOSE);
-            }
-        }
-
+        for (const path of paths) this.notice(this.toStoragePath(this.toLocalPath(path)), run);
     }
-    async start() {
-        // For addressing Deno's and chokidar's compatibility issues (especially on Windows), we use Deno's fs watcher as the primary watcher.
-        if (!this.config.useChokidar) {
-            await this.startDenoFsWatch();
-            return;
-        }
 
-        if (this.watcher) {
-            const watcher = this.watcher;
-            this.watcher = undefined;
-            await this.closeChokidarWatcher(watcher);
-        }
-        const lP = this.toStoragePath(this.toLocalPath("."));
-        this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
-        const watcher = chokidar.watch(lP,
-            {
-                ignoreInitial: !this.config.scanOfflineChanges,
-                awaitWriteFinish: {
-                    stabilityThreshold: 500,
-                },
-            });
-        this.watcher = watcher;
-
-        watcher.on("error", (ex) => {
-            if (this.watcher !== watcher) return;
-            this.watcher = undefined;
-            Logger(ex, LOG_LEVEL_NOTICE);
-            void this.closeChokidarWatcher(watcher);
-        });
-        watcher.on("change", async (path) => {
-            const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
-            if (!await this.isChanged(ePath)) {
-                // this.debugLog(`Not changed: ${ePath}`);
-            } else {
-                this.debugLog(`Changes detected: ${ePath}`);
-                await this.dispatch(path);
-            }
-        })
-        watcher.on("add", async (path) => {
-            const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
-            if (!await this.isChanged(ePath)) {
-                // this.debugLog(`Not changed: ${ePath}`);
-            } else {
-                this.debugLog(`New detected: ${ePath}`);
-                await this.dispatch(path);
-            }
-        })
-        watcher.on("unlink", async (path) => {
-            const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
-            this.debugLog(`Unlink detected: ${ePath}`);
-            await this.dispatchDeleted(path)
-        })
-    }
-    async stop() {
+    private async closeWatchers(): Promise<void> {
         const watcher = this.watcher;
-        this.watcher = undefined;
         const watcherDeno = this.watcherDeno;
+        const watcherDrain = this.watcherDrain;
+        const pending = this.pending;
+        const run = this.run;
+        this.run = undefined;
+        this.watcher = undefined;
         this.watcherDeno = undefined;
+        this.watcherDrain = undefined;
+        this.pending = new Map();
+        if (run !== undefined) {
+            for (const path of pending.keys()) cancelTask(this.timerKey(path, run));
+        }
         if (watcherDeno) {
-            try {
-                watcherDeno.close();
-            } catch (ex) {
-                // The Deno iterator cleanup can close the watcher a second time.
-                Logger(ex, LOG_LEVEL_VERBOSE);
-            }
+            try { watcherDeno.close(); }
+            catch (error) { Logger(error, LOG_LEVEL_VERBOSE); }
         }
         await this.closeChokidarWatcher(watcher);
+        await Promise.allSettled([
+            ...(watcherDrain ? [watcherDrain] : []),
+            ...[...pending.values()].flatMap(entry => entry.running ? [entry.running] : []),
+        ]);
     }
+
+    private async consumeDeno(watcher: Deno.FsWatcher, run: number): Promise<void> {
+        try {
+            for await (const event of watcher) {
+                if (run !== this.run) break;
+                this.processFile(event);
+            }
+        } catch (error) {
+            if (run === this.run) Logger(error, LOG_LEVEL_NOTICE);
+        } finally {
+            if (this.watcherDeno === watcher) this.watcherDeno = undefined;
+        }
+    }
+
+    async start(): Promise<void> {
+        const run = ++this.epoch;
+        await this.closeWatchers();
+        if (run !== this.epoch) return;
+        const root = this.toStoragePath(this.toLocalPath("."));
+        this.run = run;
+        if (this.config.useChokidar) {
+            const watcher = chokidar.watch(root, {
+                ignoreInitial: !this.config.scanOfflineChanges,
+                ignored: (path: string) => path.split(/[\\/]/).at(-1)?.startsWith(".otask-tmp-") ?? false,
+                awaitWriteFinish: { stabilityThreshold: 500 },
+            });
+            this.watcher = watcher;
+            watcher.on("error", error => {
+                if (run !== this.run) return;
+                this.watcher = undefined;
+                Logger(error, LOG_LEVEL_NOTICE);
+                void this.closeChokidarWatcher(watcher);
+            });
+            for (const kind of ["add", "change", "unlink"] as const) {
+                watcher.on(kind, path => this.notice(path, run));
+            }
+        } else {
+            const watcher = Deno.watchFs(root, { recursive: true });
+            this.watcherDeno = watcher;
+            this.watcherDrain = this.consumeDeno(watcher, run);
+        }
+        this.restoreAbsent(run);
+        if (!this.config.useChokidar && this.config.scanOfflineChanges) {
+            await this.scanDirectory(root, run);
+        }
+    }
+
+    async stop(): Promise<void> {
+        ++this.epoch;
+        await this.closeWatchers();
+    }
+
     override health(): PeerHealth {
         const ok = !!(this.watcherDeno || this.watcher);
-        // No remote backend (backendUp always true). A storage peer still doing its
-        // initial offline scan is "starting", not yet healthy, so the base restart
-        // logic won't flag it — only a watcher that dies after being healthy counts.
-        return { name: this.config.name, type: "storage", ok, detail: ok ? "watching" : "starting", backendUp: true, restartWorthy: false };
+        const oldest = this.pending.entries().next().value;
+        const detail = `${ok ? "watching" : "starting"}${oldest ? `; ${this.pending.size} pending, oldest ${oldest[0]} for ${Math.floor((Date.now() - oldest[1].since) / 1000)}s${oldest[1].reason ? ": " + oldest[1].reason : ""}` : ""}`;
+        return { name: this.config.name, type: "storage", ok, detail, backendUp: true, restartWorthy: false };
     }
 }
